@@ -50,7 +50,7 @@ spec:
           terminationGracePeriodSeconds: 30
 
           nodeSelector:
-            node.kubernetes.io/instance-type: p5.48xlarge
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
 
           volumes:
           # Shared memory for NCCL (sized for 8x H100)
@@ -166,7 +166,7 @@ spec:
           terminationGracePeriodSeconds: 30
 
           nodeSelector:
-            node.kubernetes.io/instance-type: p5.48xlarge
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
 
           # Ensure worker is on different node than master
           affinity:
@@ -294,7 +294,7 @@ spec:
           dnsPolicy: ClusterFirstWithHostNet
           terminationGracePeriodSeconds: 30
           nodeSelector:
-            node.kubernetes.io/instance-type: p5.48xlarge
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
 
           volumes:
           - name: shm
@@ -395,7 +395,7 @@ spec:
           dnsPolicy: ClusterFirstWithHostNet
           terminationGracePeriodSeconds: 30
           nodeSelector:
-            node.kubernetes.io/instance-type: p5.48xlarge
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
 
           affinity:
             podAntiAffinity:

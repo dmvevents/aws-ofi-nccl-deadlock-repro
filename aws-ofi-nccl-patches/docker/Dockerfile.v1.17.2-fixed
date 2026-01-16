@@ -1,0 +1,60 @@
+# Dockerfile.v1.17.2-fixed
+#
+# Builds aws-ofi-nccl v1.17.2 (FIXED version - control group)
+# This has the PR #968 fix applied - should NOT deadlock
+#
+# Build:
+#   docker build -f Dockerfile.v1.17.2-fixed -t deadlock-test:v1.17.2-fixed .
+
+ARG BASE_IMAGE=058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+FROM ${BASE_IMAGE}
+
+COPY moe_stress_test.py rdma_stress_test.py /workspace/
+
+# Build aws-ofi-nccl v1.17.2 (with fix intact)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool git && \
+    rm -rf /var/lib/apt/lists/* && \
+    \
+    # Clone v1.17.2
+    cd /tmp && \
+    git clone --depth 1 --branch v1.17.2 https://github.com/aws/aws-ofi-nccl.git && \
+    cd aws-ofi-nccl && \
+    \
+    # Show the FIXED line (uses dereg_mr_no_lock)
+    echo "=== Verifying fix is present ===" && \
+    grep -n "dereg_mr_no_lock" src/nccl_ofi_rdma.cpp | head -3 && \
+    \
+    # Build
+    ./autogen.sh && \
+    ./configure \
+        --with-libfabric=/opt/amazon/efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --prefix=/tmp/install && \
+    make -j$(nproc) && \
+    make install && \
+    \
+    # Install
+    mkdir -p /opt/aws-ofi-nccl-backup && \
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so /opt/aws-ofi-nccl-backup/ && \
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-ofi-tuner.so /opt/aws-ofi-nccl-backup/ 2>/dev/null || true && \
+    cp /tmp/install/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    cp /tmp/install/lib/libnccl-ofi-tuner.so /opt/amazon/aws-ofi-nccl/lib/ 2>/dev/null || true && \
+    \
+    # Create marker
+    echo "v1.17.2-fixed" > /opt/aws-ofi-nccl-version.txt && \
+    \
+    # Cleanup
+    rm -rf /tmp/aws-ofi-nccl /tmp/install && \
+    \
+    # Verify
+    echo "=== Installed aws-ofi-nccl ===" && \
+    strings /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so | grep "aws-ofi-nccl" | head -1 && \
+    cat /opt/aws-ofi-nccl-version.txt
+
+WORKDIR /workspace
+
+LABEL aws.ofi.nccl.version="v1.17.2-fixed" \
+      test.type="control-group" \
+      test.purpose="Verify fix works - should NOT deadlock"

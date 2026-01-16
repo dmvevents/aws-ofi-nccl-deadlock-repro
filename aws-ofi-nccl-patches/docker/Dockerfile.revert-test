@@ -1,0 +1,90 @@
+# Dockerfile.revert-test
+# Scientific test: Start with v1.17.2 and REVERT PR #968 to reintroduce bug
+#
+# This approach:
+#   1. Uses your working v1.17.2 codebase
+#   2. Reverts ONLY the deadlock fix (PR #968)
+#   3. Tests if the bug can still be triggered
+#
+# Build:
+#   # Test image (bug reintroduced):
+#   docker build --build-arg REVERT_PR968=true -t deadlock-test:revert-pr968 -f Dockerfile.revert-test .
+#
+#   # Control image (no revert):
+#   docker build --build-arg REVERT_PR968=false -t deadlock-test:control -f Dockerfile.revert-test .
+
+ARG BASE_IMAGE=058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+FROM ${BASE_IMAGE}
+
+# Whether to revert PR #968 (the deadlock fix)
+ARG REVERT_PR968=true
+
+# PR #968 commit hash - the MR deadlock fix
+ENV PR968_COMMIT=06e3ebd1f934bc8334f6fb9b670b573c6b77c6ae
+
+# Copy source files
+COPY fi_mr_inject.c /tmp/
+COPY entrypoint-scientific.sh /entrypoint-scientific.sh
+COPY moe_stress_test.py rdma_stress_test.py /workspace/
+
+# Single RUN: build aws-ofi-nccl with optional revert
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool git && \
+    rm -rf /var/lib/apt/lists/* && \
+    \
+    # Clone v1.17.2
+    cd /tmp && \
+    git clone https://github.com/aws/aws-ofi-nccl.git && \
+    cd aws-ofi-nccl && \
+    git checkout v1.17.2 && \
+    \
+    # Conditionally revert PR #968
+    if [ "${REVERT_PR968}" = "true" ]; then \
+        echo "=== REVERTING PR #968 (deadlock fix) ===" && \
+        git revert --no-commit ${PR968_COMMIT} || \
+        echo "WARNING: Automatic revert failed, manual patch may be needed"; \
+    else \
+        echo "=== KEEPING PR #968 (control test) ==="; \
+    fi && \
+    \
+    # Build
+    ./autogen.sh && \
+    ./configure \
+        --with-libfabric=/opt/amazon/efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --prefix=/tmp/install && \
+    make -j$(nproc) && \
+    make install && \
+    \
+    # Build fault injection library
+    gcc -shared -fPIC -O2 -o /tmp/libfi_mr_inject.so /tmp/fi_mr_inject.c -ldl -lpthread && \
+    \
+    # Install
+    mkdir -p /opt/aws-ofi-nccl-backup && \
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so /opt/aws-ofi-nccl-backup/ && \
+    cp /tmp/install/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    cp /tmp/install/lib/libnccl-ofi-tuner.so /opt/amazon/aws-ofi-nccl/lib/ 2>/dev/null || true && \
+    cp /tmp/libfi_mr_inject.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    \
+    # Create markers
+    if [ "${REVERT_PR968}" = "true" ]; then \
+        echo "v1.17.2-REVERTED-PR968" > /opt/aws-ofi-nccl-version.txt; \
+    else \
+        echo "v1.17.2-CONTROL" > /opt/aws-ofi-nccl-version.txt; \
+    fi && \
+    chmod +x /entrypoint-scientific.sh && \
+    \
+    # Cleanup
+    rm -rf /tmp/aws-ofi-nccl /tmp/install /tmp/fi_mr_inject.c /tmp/libfi_mr_inject.so && \
+    \
+    # Verify
+    echo "Installed version:" && cat /opt/aws-ofi-nccl-version.txt && \
+    strings /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so | grep "aws-ofi-nccl" | head -1
+
+WORKDIR /workspace
+
+LABEL test.type="scientific-revert-test" \
+      test.pr968.reverted="${REVERT_PR968}"
+
+ENTRYPOINT ["/entrypoint-scientific.sh"]

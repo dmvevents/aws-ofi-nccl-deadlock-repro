@@ -1,0 +1,100 @@
+# NCCL test with STANDARD libfabric (no patching) to verify baseline
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nccl-standard-test
+  namespace: kubeflow
+  labels:
+    app: nccl-standard-test
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 60
+  nodeSelector:
+    node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+  volumes:
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+
+  containers:
+  - name: test
+    image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-with-bug
+    imagePullPolicy: Always
+
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -e
+      echo "=============================================="
+      echo "NCCL TEST WITH STANDARD LIBFABRIC"
+      echo "=============================================="
+
+      # Use STANDARD libfabric (NOT patched)
+      export LD_LIBRARY_PATH=/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+
+      export NCCL_NET="AWS Libfabric"
+      export NCCL_DEBUG=INFO
+      export NCCL_DEBUG_SUBSYS=INIT,NET
+      export NCCL_TIMEOUT=300
+      export FI_PROVIDER=efa
+      export FI_EFA_USE_HUGE_PAGE=0
+
+      cat > /tmp/nccl_test.py << 'EOF'
+      import os, sys, time, torch
+      import torch.multiprocessing as mp
+      import torch.distributed as dist
+      def worker(rank, world_size):
+          os.environ["MASTER_ADDR"] = "127.0.0.1"
+          os.environ["MASTER_PORT"] = "29501"
+          os.environ["RANK"] = str(rank)
+          os.environ["WORLD_SIZE"] = str(world_size)
+          torch.cuda.set_device(rank)
+          dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+          if rank == 0:
+              print(f"NCCL initialized: {world_size} GPUs, version {torch.cuda.nccl.version()}")
+          for i in range(100):
+              t = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+              dist.all_reduce(t)
+              del t
+              if rank == 0 and (i+1) % 50 == 0:
+                  print(f"Iteration {i+1}/100")
+          dist.barrier()
+          if rank == 0:
+              print("TEST COMPLETED SUCCESSFULLY")
+          dist.destroy_process_group()
+      if __name__ == "__main__":
+          world_size = torch.cuda.device_count()
+          print(f"Starting {world_size} workers...")
+          mp.spawn(worker, args=(world_size,), nprocs=world_size, join=True)
+      EOF
+
+      python3 /tmp/nccl_test.py
+
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+        vpc.amazonaws.com/efa: 32
+        hugepages-2Mi: 5120Mi
+        memory: 400Gi
+      requests:
+        nvidia.com/gpu: 8
+        vpc.amazonaws.com/efa: 32
+        hugepages-2Mi: 5120Mi
+        memory: 200Gi
+        cpu: 48
+
+    volumeMounts:
+    - name: shm
+      mountPath: /dev/shm
+
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+        - IPC_LOCK
+        - SYS_RESOURCE

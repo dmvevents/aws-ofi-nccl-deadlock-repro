@@ -1,0 +1,98 @@
+# Dockerfile.scientific-fault-inject
+#
+# Scientific test image with patched AWS libfabric for fault injection
+#
+# Build args:
+#   BUG_MODE=with-bug   - Reintroduce deadlock bug (test group)
+#   BUG_MODE=fixed      - Keep fix intact (control group)
+
+ARG BASE_IMAGE=058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+FROM ${BASE_IMAGE}
+
+ARG BUG_MODE=fixed
+
+# Copy files
+COPY moe_stress_test.py rdma_stress_test.py /workspace/
+COPY efa_mr_fault_inject.h /tmp/
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool git \
+        libibverbs-dev librdmacm-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Create missing dev symlinks for rdma-core libraries
+    ln -sf /usr/lib/x86_64-linux-gnu/libefa.so.1 /usr/lib/x86_64-linux-gnu/libefa.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so
+
+# Build patched AWS libfabric with fault injection
+RUN cd /tmp && \
+    git clone --depth 1 --branch v1.22.0amzn5.0 https://github.com/aws/libfabric.git && \
+    cd libfabric && \
+    \
+    # Copy fault injection header
+    cp /tmp/efa_mr_fault_inject.h prov/efa/src/ && \
+    \
+    # Add include for the header (after config.h)
+    sed -i '/#include "config.h"/a #include "efa_mr_fault_inject.h"' prov/efa/src/efa_mr.c && \
+    \
+    # Add fault injection check after efa_mr allocation
+    # Find the line with "efa_mr->mr_fid.fid.ops = &efa_mr_ops;" and add check after it
+    sed -i '/efa_mr->mr_fid.fid.ops = \&efa_mr_ops;/a \\n\tEFA_MR_FAULT_INJECT_CHECK();' prov/efa/src/efa_mr.c && \
+    \
+    echo "=== Verifying fault injection patch ===" && \
+    grep -n "FAULT_INJECT" prov/efa/src/efa_mr.c && \
+    \
+    ./autogen.sh && \
+    # Use system rdma-core libraries + CUDA for HMEM support
+    PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH \
+    ./configure --prefix=/opt/libfabric-fault-inject \
+        --enable-efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-cuda-dlopen && \
+    make -j$(nproc) && \
+    make install && \
+    \
+    echo "=== Patched libfabric built with CUDA/HMEM support ===" && \
+    rm -rf /tmp/libfabric /tmp/efa_mr_fault_inject.h
+
+# Build aws-ofi-nccl with patched libfabric
+RUN cd /tmp && \
+    git clone --depth 1 --branch v1.17.2 https://github.com/aws/aws-ofi-nccl.git && \
+    cd aws-ofi-nccl && \
+    \
+    if [ "${BUG_MODE}" = "with-bug" ]; then \
+        echo "=== REINTRODUCING DEADLOCK BUG ===" && \
+        sed -i 's/(void) dereg_mr_no_lock(ret_handle);/(void) this->dereg_mr(ret_handle);/' src/nccl_ofi_rdma.cpp && \
+        grep -n "this->dereg_mr(ret_handle)" src/nccl_ofi_rdma.cpp | head -3; \
+    else \
+        echo "=== KEEPING FIX INTACT ==="; \
+    fi && \
+    \
+    ./autogen.sh && \
+    ./configure \
+        --with-libfabric=/opt/libfabric-fault-inject \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --prefix=/tmp/install && \
+    make -j$(nproc) && \
+    make install && \
+    \
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so.backup && \
+    cp /tmp/install/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    \
+    echo "v1.17.2-${BUG_MODE}-fault-inject" > /opt/aws-ofi-nccl-version.txt && \
+    rm -rf /tmp/aws-ofi-nccl /tmp/install && \
+    \
+    echo "=== Build complete ===" && \
+    cat /opt/aws-ofi-nccl-version.txt
+
+WORKDIR /workspace
+
+# Simple entrypoint that sets up library paths
+ENV LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+ENV NCCL_NET="AWS Libfabric"
+ENV FI_PROVIDER=efa
+ENV FI_EFA_USE_HUGE_PAGE=0
+
+LABEL test.type="scientific-fault-injection" \
+      bug.mode="${BUG_MODE}"

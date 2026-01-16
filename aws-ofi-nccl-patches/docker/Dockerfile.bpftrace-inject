@@ -1,0 +1,110 @@
+# Dockerfile.bpftrace-inject
+#
+# Uses bpftrace uprobe to inject MR registration failures
+# The uprobe intercepts efa_mr_regattr() and occasionally returns -FI_ENOMEM
+#
+# Build args:
+#   BUG_MODE=with-bug   - Reintroduce deadlock bug (test group)
+#   BUG_MODE=fixed      - Keep fix intact (control group)
+
+ARG BASE_IMAGE=058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+FROM ${BASE_IMAGE}
+
+ARG BUG_MODE=fixed
+
+# Copy test scripts
+COPY moe_stress_test.py memory_pressure_test.py /workspace/
+
+# Install bpftrace and build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bpftrace \
+        build-essential autoconf automake libtool git \
+        libibverbs-dev librdmacm-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build aws-ofi-nccl with STANDARD libfabric (from /opt/amazon/efa)
+RUN cd /tmp && \
+    git clone --depth 1 --branch v1.17.2 https://github.com/aws/aws-ofi-nccl.git && \
+    cd aws-ofi-nccl && \
+    \
+    if [ "${BUG_MODE}" = "with-bug" ]; then \
+        echo "=== REINTRODUCING DEADLOCK BUG ===" && \
+        echo "Changing dereg_mr_no_lock() to dereg_mr() in error handler" && \
+        sed -i 's/(void) dereg_mr_no_lock(ret_handle);/(void) this->dereg_mr(ret_handle);/' src/nccl_ofi_rdma.cpp && \
+        echo "Verification:" && \
+        grep -n "this->dereg_mr(ret_handle)" src/nccl_ofi_rdma.cpp | head -3; \
+    else \
+        echo "=== KEEPING FIX INTACT ==="; \
+    fi && \
+    \
+    ./autogen.sh && \
+    ./configure \
+        --with-libfabric=/opt/amazon/efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --prefix=/tmp/install && \
+    make -j$(nproc) && \
+    make install && \
+    \
+    # Backup original and install new
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so.backup && \
+    cp /tmp/install/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    \
+    echo "v1.17.2-${BUG_MODE}-bpftrace" > /opt/aws-ofi-nccl-version.txt && \
+    rm -rf /tmp/aws-ofi-nccl /tmp/install && \
+    \
+    echo "=== Build complete ===" && \
+    cat /opt/aws-ofi-nccl-version.txt
+
+# Create bpftrace script for MR fault injection
+RUN cat > /workspace/mr_fault_inject.bt << 'EOF'
+#!/usr/bin/env bpftrace
+/*
+ * MR Fault Injection Script
+ * Intercepts efa_mr_regattr in libfabric EFA provider
+ * Injects -FI_ENOMEM (12) failures periodically
+ */
+
+BEGIN
+{
+    printf("MR Fault Injection Started\n");
+    printf("Injecting failures every %d calls after %d warmup\n",
+           $1 > 0 ? $1 : 20, $2 > 0 ? $2 : 100);
+    @call_count = 0;
+    @inject_rate = $1 > 0 ? $1 : 20;
+    @inject_start = $2 > 0 ? $2 : 100;
+}
+
+/*
+ * Intercept return from efa_mr_regattr
+ * Library: /opt/amazon/efa/lib/libfabric.so.1
+ */
+uretprobe:/opt/amazon/efa/lib/libfabric.so.1:efa_mr_regattr
+{
+    @call_count++;
+
+    if (@call_count > @inject_start &&
+        (@call_count - @inject_start) % @inject_rate == 0) {
+        printf("[INJECT] Call %d: Changing retval from %d to -12 (ENOMEM)\n",
+               @call_count, retval);
+        /* Override return value to -FI_ENOMEM (12) */
+        override(-12);
+    }
+}
+
+END
+{
+    printf("\nTotal calls intercepted: %d\n", @call_count);
+}
+EOF
+
+WORKDIR /workspace
+
+# Standard library paths
+ENV LD_LIBRARY_PATH=/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+ENV NCCL_NET="AWS Libfabric"
+ENV FI_PROVIDER=efa
+ENV FI_EFA_USE_HUGE_PAGE=0
+
+LABEL test.type="bpftrace-fault-injection" \
+      bug.mode="${BUG_MODE}"

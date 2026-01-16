@@ -1,0 +1,91 @@
+# Dockerfile for aws-ofi-nccl bug testing
+# Builds aws-ofi-nccl with specific bugs reintroduced
+#
+# Build args:
+#   BUG_TYPE: bug1, bug3, all, none, v1.14.0, v1.17.2
+#
+# Usage:
+#   docker build --build-arg BUG_TYPE=bug1 -t aws-ofi-nccl-bug1 -f Dockerfile.bug-test .
+#   docker build --build-arg BUG_TYPE=v1.14.0 -t aws-ofi-nccl-v1.14.0 -f Dockerfile.bug-test .
+
+ARG BASE_IMAGE=058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+FROM ${BASE_IMAGE}
+
+ARG BUG_TYPE=none
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up build environment
+ENV BUILD_DIR=/tmp/aws-ofi-nccl-build
+ENV INSTALL_PREFIX=/opt/aws-ofi-nccl-${BUG_TYPE}
+
+# Commit hashes for bug fixes
+ENV PR968_COMMIT=06e3ebd1f934bc8334f6fb9b670b573c6b77c6ae
+ENV PR1087_COMMIT=4071e8b61bc2d1e998dd58900a46bfc8b7ce9fa1
+
+WORKDIR ${BUILD_DIR}
+
+# Clone and build aws-ofi-nccl
+RUN git clone https://github.com/aws/aws-ofi-nccl.git && \
+    cd aws-ofi-nccl && \
+    # Checkout based on BUG_TYPE
+    if [ "${BUG_TYPE}" = "v1.14.0" ]; then \
+        git checkout v1.14.0; \
+    elif [ "${BUG_TYPE}" = "v1.17.2" ]; then \
+        git checkout v1.17.2; \
+    else \
+        git checkout master; \
+        # Apply reverts for specific bugs
+        if [ "${BUG_TYPE}" = "bug1" ] || [ "${BUG_TYPE}" = "all" ]; then \
+            echo "Attempting to revert PR #968..."; \
+            git revert --no-commit ${PR968_COMMIT} 2>/dev/null || echo "PR #968 revert needs manual intervention"; \
+        fi; \
+        if [ "${BUG_TYPE}" = "bug3" ] || [ "${BUG_TYPE}" = "all" ]; then \
+            echo "Attempting to revert PR #1087..."; \
+            git revert --no-commit ${PR1087_COMMIT} 2>/dev/null || echo "PR #1087 revert needs manual intervention"; \
+        fi; \
+    fi && \
+    ./autogen.sh && \
+    ./configure \
+        --with-libfabric=/opt/amazon/efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --prefix=${INSTALL_PREFIX} && \
+    make -j$(nproc) && \
+    make install
+
+# Verify build
+RUN ls -la ${INSTALL_PREFIX}/lib/ && \
+    echo "Build type: ${BUG_TYPE}" && \
+    strings ${INSTALL_PREFIX}/lib/libnccl-net.so | grep -iE "version|aws-ofi" | head -3
+
+# CRITICAL: Replace the library in /opt/amazon/aws-ofi-nccl/lib
+# This ensures our version is used even when entrypoint sets LD_LIBRARY_PATH
+RUN mkdir -p /opt/aws-ofi-nccl-orig && \
+    mv /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so /opt/aws-ofi-nccl-orig/ && \
+    mv /opt/amazon/aws-ofi-nccl/lib/libnccl-ofi-tuner.so /opt/aws-ofi-nccl-orig/ 2>/dev/null || true && \
+    cp ${INSTALL_PREFIX}/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    cp ${INSTALL_PREFIX}/lib/libnccl-ofi-tuner.so /opt/amazon/aws-ofi-nccl/lib/ 2>/dev/null || true && \
+    echo "Replaced /opt/amazon/aws-ofi-nccl/lib with ${BUG_TYPE} version:" && \
+    ls -la /opt/amazon/aws-ofi-nccl/lib/ && \
+    strings /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so | grep -iE "aws-ofi-nccl" | head -1
+
+# Create marker file for easy identification
+RUN echo "${BUG_TYPE}" > /opt/aws-ofi-nccl-variant.txt
+
+WORKDIR /workspace
+
+# Copy test scripts
+COPY moe_stress_test.py /workspace/
+COPY rdma_stress_test.py /workspace/
+
+# Label the image
+LABEL aws.ofi.nccl.bug.type="${BUG_TYPE}" \
+      aws.ofi.nccl.test.purpose="Bug reproduction testing"

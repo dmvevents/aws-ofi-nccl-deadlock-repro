@@ -1,0 +1,82 @@
+# Direct Pod test for fault injection validation
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fault-inject-direct-test
+  namespace: kubeflow
+  labels:
+    app: fault-inject-direct-test
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 30
+  nodeSelector:
+    node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+  volumes:
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+
+  containers:
+  - name: test
+    image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-with-bug
+    imagePullPolicy: Always
+
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -e
+      echo "=============================================="
+      echo "DIRECT FAULT INJECTION TEST"
+      echo "=============================================="
+      cat /opt/aws-ofi-nccl-version.txt
+      echo ""
+
+      export LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+      export FI_PROVIDER=efa
+      export FI_EFA_USE_HUGE_PAGE=0
+
+      export FI_EFA_MR_INJECT_ENABLE=1
+      export FI_EFA_MR_INJECT_START=5
+      export FI_EFA_MR_INJECT_RATE=3
+
+      echo "Settings:"
+      env | grep FI_EFA_MR_INJECT
+      echo ""
+
+      echo "Verifying patched libfabric..."
+      strings /opt/libfabric-fault-inject/lib/libfabric.so.1 | grep -i "EFA_MR_INJECT" | head -3
+      echo ""
+
+      echo "Running simple PyTorch/CUDA test..."
+      python3 -c 'import torch; print("PyTorch:", torch.__version__); print("CUDA:", torch.cuda.is_available()); print("GPUs:", torch.cuda.device_count() if torch.cuda.is_available() else 0); print("NCCL:", torch.cuda.nccl.version() if torch.cuda.is_available() else "N/A")'
+      echo ""
+      echo "TEST COMPLETED"
+
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+        vpc.amazonaws.com/efa: 4
+        hugepages-2Mi: 1280Mi
+        memory: 50Gi
+      requests:
+        nvidia.com/gpu: 1
+        vpc.amazonaws.com/efa: 4
+        hugepages-2Mi: 1280Mi
+        memory: 25Gi
+        cpu: 8
+
+    volumeMounts:
+    - name: shm
+      mountPath: /dev/shm
+
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+        - IPC_LOCK
+        - SYS_RESOURCE

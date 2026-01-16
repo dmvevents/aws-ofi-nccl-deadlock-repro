@@ -1,0 +1,172 @@
+# Fault Injection Test - FIXED VERSION (Control Group)
+#
+# Uses patched libfabric with CUDA/HMEM support + fault injection
+# aws-ofi-nccl with FIX INTACT (dereg_mr_no_lock)
+#
+# Expected: Graceful error handling, NO DEADLOCK
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: fault-inject-fixed-test
+  namespace: kubeflow
+spec:
+  nprocPerNode: "8"
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        spec:
+          terminationGracePeriodSeconds: 120
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          containers:
+          - name: pytorch
+            # FIXED VERSION - should NOT deadlock
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-fixed-v3
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "=============================================="
+              echo "FAULT INJECTION TEST - FIXED VERSION (CONTROL)"
+              echo "=============================================="
+              cat /opt/aws-ofi-nccl-version.txt
+              echo ""
+
+              export LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+              export NCCL_NET="AWS Libfabric"
+              export NCCL_DEBUG=INFO
+              export NCCL_DEBUG_SUBSYS=INIT,NET
+              export NCCL_TIMEOUT=300
+              export FI_PROVIDER=efa
+              export FI_EFA_USE_HUGE_PAGE=0
+
+              # SAME fault injection settings as buggy test
+              export FI_EFA_MR_INJECT_ENABLE=1
+              export FI_EFA_MR_INJECT_START=100
+              export FI_EFA_MR_INJECT_RATE=20
+
+              echo "FAULT INJECTION ENABLED:"
+              echo "  FI_EFA_MR_INJECT_ENABLE=$FI_EFA_MR_INJECT_ENABLE"
+              echo "  FI_EFA_MR_INJECT_START=$FI_EFA_MR_INJECT_START"
+              echo "  FI_EFA_MR_INJECT_RATE=$FI_EFA_MR_INJECT_RATE"
+              echo ""
+
+              torchrun \
+                --nnodes=$PET_NNODES \
+                --nproc_per_node=8 \
+                --node_rank=$PET_NODE_RANK \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+                --rdzv_id=fault-inject-fixed-test \
+                /workspace/moe_stress_test.py
+
+              echo ""
+              echo "=============================================="
+              echo "TEST COMPLETE"
+              echo "=============================================="
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        spec:
+          terminationGracePeriodSeconds: 120
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-fixed-v3
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "=============================================="
+              echo "FAULT INJECTION TEST - FIXED VERSION (CONTROL)"
+              echo "=============================================="
+              cat /opt/aws-ofi-nccl-version.txt
+              echo ""
+
+              export LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+              export NCCL_NET="AWS Libfabric"
+              export NCCL_DEBUG=INFO
+              export NCCL_DEBUG_SUBSYS=INIT,NET
+              export NCCL_TIMEOUT=300
+              export FI_PROVIDER=efa
+              export FI_EFA_USE_HUGE_PAGE=0
+
+              export FI_EFA_MR_INJECT_ENABLE=1
+              export FI_EFA_MR_INJECT_START=100
+              export FI_EFA_MR_INJECT_RATE=20
+
+              echo "FAULT INJECTION ENABLED:"
+              echo "  FI_EFA_MR_INJECT_ENABLE=$FI_EFA_MR_INJECT_ENABLE"
+              echo "  FI_EFA_MR_INJECT_START=$FI_EFA_MR_INJECT_START"
+              echo "  FI_EFA_MR_INJECT_RATE=$FI_EFA_MR_INJECT_RATE"
+              echo ""
+
+              torchrun \
+                --nnodes=$PET_NNODES \
+                --nproc_per_node=8 \
+                --node_rank=$PET_NODE_RANK \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+                --rdzv_id=fault-inject-fixed-test \
+                /workspace/moe_stress_test.py
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

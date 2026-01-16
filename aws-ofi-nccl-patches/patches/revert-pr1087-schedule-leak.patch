@@ -1,0 +1,41 @@
+# Revert patch for PR #1087 - Schedule leak after fi_write
+# Original fix: 4071e8b61bc2d1e998dd58900a46bfc8b7ce9fa1
+# This patch REINTRODUCES the bug by removing schedule release calls
+#
+# The bug: In post_rdma_ctrl(), the schedule object was not being released
+# after fi_write() completes, causing memory leak over time.
+#
+# To apply: git apply revert-pr1087-schedule-leak.patch
+# To test: Run long RDMA stress test and monitor memory growth
+
+--- a/src/nccl_ofi_rdma.cpp
++++ b/src/nccl_ofi_rdma.cpp
+@@ -5290,9 +5290,7 @@ int nccl_net_ofi_rdma_ep_t::post_rdma_ctrl(
+ 	nccl_net_ofi_scheduler_t *scheduler = device->get_scheduler();
+ 	bool have_ctrl = false;
+ 	bool need_flush = false;
+-	nccl_net_ofi_schedule_t *schedule = NULL;
+
+ 	if (num_buffs == 0 && ctrl_data == NULL) {
+-		schedule = scheduler->get_schedule(0, device->num_rails);
++		nccl_net_ofi_schedule_t *schedule = scheduler->get_schedule(0, device->num_rails);
+ 		if (!schedule) {
+ 			NCCL_OFI_WARN("Failed to get schedule for ctrl post");
+ 			return -ENOMEM;
+@@ -5301,10 +5299,6 @@ int nccl_net_ofi_rdma_ep_t::post_rdma_ctrl(
+ 		if (schedule->rail_id < 0 || schedule->rail_id >= (int)device->num_rails) {
+ 			NCCL_OFI_WARN("Invalid rail_id %d from scheduler", schedule->rail_id);
+-			nccl_net_ofi_release_schedule(scheduler, schedule);
+ 			return -EINVAL;
+ 		}
+ 		have_ctrl = true;
+@@ -5327,10 +5321,6 @@ int nccl_net_ofi_rdma_ep_t::post_rdma_ctrl(
+ 		// ... rest of function
+ 	}
+
+-	if (schedule) {
+-		nccl_net_ofi_release_schedule(scheduler, schedule);
+-	}
+-
+ 	return ret;
+ }

@@ -1,0 +1,168 @@
+# Memory Pressure Test - FIXED VERSION (Control Group)
+#
+# Uses STANDARD libfabric + aws-ofi-nccl with fix intact
+# This should NOT deadlock under the same conditions
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: memory-pressure-fixed-test
+  namespace: kubeflow
+spec:
+  nprocPerNode: "8"
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 120
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          containers:
+          - name: pytorch
+            # FIXED VERSION - should handle MR failures gracefully
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:memory-pressure-fixed
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "=============================================="
+              echo "MEMORY PRESSURE TEST - FIXED VERSION (CONTROL)"
+              echo "=============================================="
+              cat /opt/aws-ofi-nccl-version.txt
+              echo ""
+
+              export NCCL_NET="AWS Libfabric"
+              export NCCL_DEBUG=INFO
+              export NCCL_DEBUG_SUBSYS=INIT,NET
+              export NCCL_TIMEOUT=300
+              export FI_PROVIDER=efa
+              export FI_EFA_USE_HUGE_PAGE=0
+
+              export MEMORY_PRESSURE=0.85
+              export ITERATIONS=3000
+              export REPORT_INTERVAL=100
+
+              echo "MEMORY_PRESSURE=$MEMORY_PRESSURE"
+              echo "ITERATIONS=$ITERATIONS"
+              echo "Starting test..."
+              echo ""
+
+              torchrun \
+                --nnodes=$PET_NNODES \
+                --nproc_per_node=8 \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+                --rdzv_id=$PYTORCH_JOB_NAME \
+                /workspace/memory_pressure_test.py
+
+              echo ""
+              echo "=============================================="
+              echo "TEST COMPLETE"
+              echo "=============================================="
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 120
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          containers:
+          - name: pytorch
+            # FIXED VERSION - should handle MR failures gracefully
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:memory-pressure-fixed
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "=============================================="
+              echo "MEMORY PRESSURE TEST - FIXED VERSION (CONTROL)"
+              echo "=============================================="
+              cat /opt/aws-ofi-nccl-version.txt
+              echo ""
+
+              export NCCL_NET="AWS Libfabric"
+              export NCCL_DEBUG=INFO
+              export NCCL_DEBUG_SUBSYS=INIT,NET
+              export NCCL_TIMEOUT=300
+              export FI_PROVIDER=efa
+              export FI_EFA_USE_HUGE_PAGE=0
+
+              export MEMORY_PRESSURE=0.85
+              export ITERATIONS=3000
+              export REPORT_INTERVAL=100
+
+              echo "MEMORY_PRESSURE=$MEMORY_PRESSURE"
+              echo "ITERATIONS=$ITERATIONS"
+              echo "Starting test..."
+              echo ""
+
+              torchrun \
+                --nnodes=$PET_NNODES \
+                --nproc_per_node=8 \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+                --rdzv_id=$PYTORCH_JOB_NAME \
+                /workspace/memory_pressure_test.py
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

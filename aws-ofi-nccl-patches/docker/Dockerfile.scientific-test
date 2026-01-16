@@ -1,0 +1,58 @@
+# Dockerfile.scientific-test - Consolidated for layer limit
+# Scientific test for aws-ofi-nccl MR deadlock bug (PR #968)
+
+ARG BASE_IMAGE=058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+FROM ${BASE_IMAGE}
+
+ARG VERSION=v1.14.0
+
+# Copy source files first
+COPY fi_mr_inject.c /tmp/
+COPY entrypoint-scientific.sh /entrypoint-scientific.sh
+COPY moe_stress_test.py rdma_stress_test.py /workspace/
+
+# Single RUN to minimize layers: install deps, build aws-ofi-nccl, build injector, install
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool git && \
+    rm -rf /var/lib/apt/lists/* && \
+    \
+    # Build aws-ofi-nccl
+    cd /tmp && \
+    git clone --depth 1 --branch ${VERSION} https://github.com/aws/aws-ofi-nccl.git && \
+    cd aws-ofi-nccl && \
+    ./autogen.sh && \
+    ./configure \
+        --with-libfabric=/opt/amazon/efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --prefix=/tmp/install && \
+    make -j$(nproc) && \
+    make install && \
+    \
+    # Build fault injection library
+    gcc -shared -fPIC -O2 -o /tmp/libfi_mr_inject.so /tmp/fi_mr_inject.c -ldl -lpthread && \
+    \
+    # Install - backup and replace
+    mkdir -p /opt/aws-ofi-nccl-backup && \
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so /opt/aws-ofi-nccl-backup/ && \
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-ofi-tuner.so /opt/aws-ofi-nccl-backup/ 2>/dev/null || true && \
+    cp /tmp/install/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    cp /tmp/install/lib/libnccl-ofi-tuner.so /opt/amazon/aws-ofi-nccl/lib/ 2>/dev/null || true && \
+    cp /tmp/libfi_mr_inject.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    \
+    # Create marker and cleanup
+    echo "${VERSION}" > /opt/aws-ofi-nccl-version.txt && \
+    chmod +x /entrypoint-scientific.sh && \
+    rm -rf /tmp/aws-ofi-nccl /tmp/install /tmp/fi_mr_inject.c /tmp/libfi_mr_inject.so && \
+    \
+    # Verify
+    echo "Installed aws-ofi-nccl:" && \
+    strings /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so | grep "aws-ofi-nccl" | head -1 && \
+    ls -la /opt/amazon/aws-ofi-nccl/lib/
+
+WORKDIR /workspace
+
+LABEL aws.ofi.nccl.version="${VERSION}" \
+      test.type="scientific-deadlock-test"
+
+ENTRYPOINT ["/entrypoint-scientific.sh"]

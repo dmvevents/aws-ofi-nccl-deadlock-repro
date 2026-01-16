@@ -1,0 +1,98 @@
+# Single-node 8-GPU NCCL test with EFA fault injection
+# This tests NCCL communication on one node to validate fault injection
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nccl-fault-inject-test
+  namespace: kubeflow
+  labels:
+    app: nccl-fault-inject-test
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 60
+  nodeSelector:
+    node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+  volumes:
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+
+  containers:
+  - name: test
+    image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-with-bug
+    imagePullPolicy: Always
+
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -e
+      echo "=============================================="
+      echo "SINGLE-NODE NCCL TEST WITH FAULT INJECTION"
+      echo "=============================================="
+      cat /opt/aws-ofi-nccl-version.txt
+      echo ""
+
+      # Set library paths
+      export LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+
+      # NCCL settings
+      export NCCL_NET="AWS Libfabric"
+      export NCCL_DEBUG=INFO
+      export NCCL_DEBUG_SUBSYS=INIT,NET
+      export NCCL_TIMEOUT=300
+
+      # EFA settings
+      export FI_PROVIDER=efa
+      export FI_EFA_USE_HUGE_PAGE=0
+
+      # FAULT INJECTION - aggressive settings for quick testing
+      export FI_EFA_MR_INJECT_ENABLE=1
+      export FI_EFA_MR_INJECT_START=100
+      export FI_EFA_MR_INJECT_RATE=20
+
+      echo "FAULT INJECTION ENABLED:"
+      echo "  FI_EFA_MR_INJECT_START=$FI_EFA_MR_INJECT_START"
+      echo "  FI_EFA_MR_INJECT_RATE=$FI_EFA_MR_INJECT_RATE"
+      echo ""
+
+      # Run standalone 8-GPU test
+      echo "Starting 8-GPU NCCL test..."
+      torchrun --standalone --nproc_per_node=8 /workspace/moe_stress_test.py 2>&1
+
+      echo ""
+      echo "TEST COMPLETED"
+
+    env:
+    - name: ITERATIONS
+      value: "2000"
+    - name: REPORT_INTERVAL
+      value: "100"
+
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+        vpc.amazonaws.com/efa: 32
+        hugepages-2Mi: 5120Mi
+        memory: 400Gi
+      requests:
+        nvidia.com/gpu: 8
+        vpc.amazonaws.com/efa: 32
+        hugepages-2Mi: 5120Mi
+        memory: 200Gi
+        cpu: 48
+
+    volumeMounts:
+    - name: shm
+      mountPath: /dev/shm
+
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+        - IPC_LOCK
+        - SYS_RESOURCE

@@ -1,0 +1,77 @@
+# Test EFA with standard libfabric (no patching)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efa-standard-test
+  namespace: kubeflow
+  labels:
+    app: efa-standard-test
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 60
+  nodeSelector:
+    node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+  volumes:
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+
+  containers:
+  - name: test
+    image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-with-bug
+    imagePullPolicy: Always
+
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -e
+      echo "=============================================="
+      echo "EFA TEST WITH STANDARD LIBFABRIC"
+      echo "=============================================="
+
+      # Use STANDARD libfabric (not patched)
+      export LD_LIBRARY_PATH=/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+
+      echo "Testing fi_info with standard libfabric..."
+      fi_info -p efa 2>&1 | head -30 || echo "fi_info not found or failed"
+
+      echo ""
+      echo "Libfabric version:"
+      ls -la /opt/amazon/efa/lib/libfabric* 2>&1 | head -5
+
+      echo ""
+      echo "EFA devices:"
+      ls -la /dev/infiniband/ 2>&1 || echo "No infiniband devices"
+
+      echo ""
+      echo "Testing patched libfabric fi_info..."
+      LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:$LD_LIBRARY_PATH fi_info -p efa 2>&1 | head -30 || echo "Patched fi_info failed"
+
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+        vpc.amazonaws.com/efa: 4
+        hugepages-2Mi: 1280Mi
+        memory: 50Gi
+      requests:
+        nvidia.com/gpu: 1
+        vpc.amazonaws.com/efa: 4
+        hugepages-2Mi: 1280Mi
+        memory: 25Gi
+        cpu: 8
+
+    volumeMounts:
+    - name: shm
+      mountPath: /dev/shm
+
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+        - IPC_LOCK
+        - SYS_RESOURCE

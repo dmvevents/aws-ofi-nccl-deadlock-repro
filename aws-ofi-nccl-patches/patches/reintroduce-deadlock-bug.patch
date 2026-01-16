@@ -1,0 +1,31 @@
+# Patch to reintroduce the MR deadlock bug (PR #968) in aws-ofi-nccl
+#
+# This patch reverts the critical fix in reg_mr_on_device() that prevents
+# deadlock when memory registration fails.
+#
+# The Bug:
+#   When reg_mr() is called, it holds mr_cache->lock. If fi_mr_regattr() fails,
+#   the error path calls dereg_mr() which tries to acquire the SAME lock.
+#   This causes deadlock (infinite wait for a lock we already hold).
+#
+# The Fix (PR #968):
+#   Created dereg_mr_no_lock() function that doesn't acquire the lock.
+#   Error path now calls dereg_mr_no_lock() instead of dereg_mr().
+#
+# This patch:
+#   Changes dereg_mr_no_lock() back to dereg_mr() to reintroduce the deadlock.
+#
+# Apply: git apply reintroduce-deadlock-bug.patch
+# Usage: Build with this patch to test that the bug would cause real problems
+#
+--- a/src/nccl_ofi_rdma.cpp
++++ b/src/nccl_ofi_rdma.cpp
+@@ -2682,7 +2682,8 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
+ 	return 0;
+
+ error:
+-	(void) dereg_mr_no_lock(ret_handle);
++	// BUG REINTRODUCED: This causes deadlock because we already hold mr_cache->lock
++	(void) this->dereg_mr(ret_handle);
+ 	return ret;
+ }

@@ -1,0 +1,67 @@
+# Memory Pressure Test Image
+#
+# Uses STANDARD libfabric (no patching) + aws-ofi-nccl with bug reintroduced
+# This avoids the libfabric compatibility issues while still testing the bug
+#
+# Build args:
+#   BUG_MODE=with-bug   - Reintroduce deadlock bug
+#   BUG_MODE=fixed      - Keep fix intact (control)
+
+ARG BASE_IMAGE=058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+FROM ${BASE_IMAGE}
+
+ARG BUG_MODE=fixed
+
+# Copy test scripts
+COPY moe_stress_test.py memory_pressure_test.py /workspace/
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool git \
+        libibverbs-dev librdmacm-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build aws-ofi-nccl with STANDARD libfabric (from /opt/amazon/efa)
+RUN cd /tmp && \
+    git clone --depth 1 --branch v1.17.2 https://github.com/aws/aws-ofi-nccl.git && \
+    cd aws-ofi-nccl && \
+    \
+    if [ "${BUG_MODE}" = "with-bug" ]; then \
+        echo "=== REINTRODUCING DEADLOCK BUG ===" && \
+        echo "Changing dereg_mr_no_lock() to dereg_mr() in error handler" && \
+        sed -i 's/(void) dereg_mr_no_lock(ret_handle);/(void) this->dereg_mr(ret_handle);/' src/nccl_ofi_rdma.cpp && \
+        echo "Verification:" && \
+        grep -n "this->dereg_mr(ret_handle)" src/nccl_ofi_rdma.cpp | head -3; \
+    else \
+        echo "=== KEEPING FIX INTACT ==="; \
+    fi && \
+    \
+    ./autogen.sh && \
+    ./configure \
+        --with-libfabric=/opt/amazon/efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --prefix=/tmp/install && \
+    make -j$(nproc) && \
+    make install && \
+    \
+    # Backup original and install new
+    cp /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/libnccl-net.so.backup && \
+    cp /tmp/install/lib/libnccl-net.so /opt/amazon/aws-ofi-nccl/lib/ && \
+    \
+    echo "v1.17.2-${BUG_MODE}-memory-pressure" > /opt/aws-ofi-nccl-version.txt && \
+    rm -rf /tmp/aws-ofi-nccl /tmp/install && \
+    \
+    echo "=== Build complete ===" && \
+    cat /opt/aws-ofi-nccl-version.txt
+
+WORKDIR /workspace
+
+# Standard library paths (no patched libfabric)
+ENV LD_LIBRARY_PATH=/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+ENV NCCL_NET="AWS Libfabric"
+ENV FI_PROVIDER=efa
+ENV FI_EFA_USE_HUGE_PAGE=0
+
+LABEL test.type="memory-pressure" \
+      bug.mode="${BUG_MODE}"

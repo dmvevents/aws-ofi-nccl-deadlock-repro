@@ -1,0 +1,246 @@
+# Scientific Comparison: PR #968 Deadlock Bug with Fault Injection
+#
+# This test uses the SCIENTIFIC images with FAULT INJECTION enabled
+# to demonstrate the deadlock bug.
+#
+# Two variants to test:
+#   1. scientific-with-bug: Should DEADLOCK when faults injected
+#   2. scientific-fixed:    Should handle faults gracefully
+#
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deadlock-scientific-headless
+  namespace: kubeflow
+spec:
+  clusterIP: None
+  selector:
+    app: deadlock-scientific
+  ports:
+  - port: 29500
+    name: c10d
+---
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-scientific
+  namespace: kubeflow
+  labels:
+    test-type: scientific-proof
+spec:
+  nprocPerNode: "8"
+
+  runPolicy:
+    activeDeadlineSeconds: 1800
+    ttlSecondsAfterFinished: 7200
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-scientific
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            # Change to scientific-fixed for control test
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-with-bug
+            imagePullPolicy: Always
+
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "=============================================="
+              echo "SCIENTIFIC TEST: DEADLOCK BUG WITH FAULT INJECTION"
+              echo "=============================================="
+              cat /opt/aws-ofi-nccl-version.txt
+              echo ""
+
+              # Set library paths - CRITICAL: use patched libfabric
+              export LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+
+              # NCCL settings
+              export NCCL_NET="AWS Libfabric"
+              export NCCL_DEBUG=INFO
+              export NCCL_DEBUG_SUBSYS=INIT,NET
+              export NCCL_TIMEOUT=300
+
+              # EFA settings
+              export FI_PROVIDER=efa
+              export FI_EFA_USE_HUGE_PAGE=0
+
+              # FAULT INJECTION - Enable controlled MR errors
+              export FI_EFA_MR_INJECT_ENABLE=1
+              export FI_EFA_MR_INJECT_START=500
+              export FI_EFA_MR_INJECT_RATE=50
+
+              echo "FAULT INJECTION: ENABLE=$FI_EFA_MR_INJECT_ENABLE START=$FI_EFA_MR_INJECT_START RATE=$FI_EFA_MR_INJECT_RATE"
+
+              # Get master address from pod IP
+              export MASTER_ADDR=$(hostname -i)
+              export MASTER_PORT=29500
+              echo "MASTER_ADDR: $MASTER_ADDR"
+              echo "MASTER_PORT: $MASTER_PORT"
+
+              # Start test
+              torchrun \
+                --nnodes=2 \
+                --nproc_per_node=8 \
+                --node_rank=0 \
+                --master_addr=$MASTER_ADDR \
+                --master_port=$MASTER_PORT \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+                /workspace/moe_stress_test.py
+
+            env:
+            - name: ITERATIONS
+              value: "10000"
+            - name: REPORT_INTERVAL
+              value: "100"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-scientific
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-scientific
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-with-bug
+            imagePullPolicy: Always
+
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "WORKER starting..."
+              cat /opt/aws-ofi-nccl-version.txt
+
+              export LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+              export NCCL_NET="AWS Libfabric"
+              export NCCL_DEBUG=INFO
+              export NCCL_DEBUG_SUBSYS=INIT,NET
+              export NCCL_TIMEOUT=300
+              export FI_PROVIDER=efa
+              export FI_EFA_USE_HUGE_PAGE=0
+
+              export FI_EFA_MR_INJECT_ENABLE=1
+              export FI_EFA_MR_INJECT_START=500
+              export FI_EFA_MR_INJECT_RATE=50
+
+              # Wait for master to be ready
+              sleep 10
+
+              # Get master address from service
+              MASTER_HOSTNAME="deadlock-scientific-master-0"
+              export MASTER_ADDR=$(getent hosts $MASTER_HOSTNAME | awk '{print $1}')
+              if [ -z "$MASTER_ADDR" ]; then
+                echo "WARNING: Could not resolve master hostname, using DNS name"
+                export MASTER_ADDR=$MASTER_HOSTNAME
+              fi
+              export MASTER_PORT=29500
+              echo "MASTER_ADDR: $MASTER_ADDR"
+
+              torchrun \
+                --nnodes=2 \
+                --nproc_per_node=8 \
+                --node_rank=1 \
+                --master_addr=$MASTER_ADDR \
+                --master_port=$MASTER_PORT \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+                /workspace/moe_stress_test.py
+
+            env:
+            - name: ITERATIONS
+              value: "10000"
+            - name: REPORT_INTERVAL
+              value: "100"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

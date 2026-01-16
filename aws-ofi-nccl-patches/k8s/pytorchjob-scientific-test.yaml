@@ -1,0 +1,239 @@
+# PyTorchJob for Scientific Deadlock Testing
+#
+# This manifest tests whether the MR deadlock bug (PR #968) can be reproduced
+# with fault injection on aws-ofi-nccl v1.14.0 (vulnerable).
+#
+# Test matrix:
+#   IMAGE_TAG=scientific-v1.14.0 + INJECT=1 → Expected: DEADLOCK
+#   IMAGE_TAG=scientific-v1.17.2 + INJECT=1 → Expected: NO DEADLOCK
+#
+# Usage:
+#   kubectl apply -f pytorchjob-scientific-test.yaml
+#   kubectl logs -f deadlock-scientific-master-0 -n kubeflow
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deadlock-scientific-headless
+  namespace: kubeflow
+spec:
+  clusterIP: None
+  selector:
+    app: deadlock-scientific
+  ports:
+  - port: 23456
+    name: master
+---
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-scientific
+  namespace: kubeflow
+  labels:
+    test-type: scientific-deadlock-test
+spec:
+  nprocPerNode: "8"
+
+  runPolicy:
+    activeDeadlineSeconds: 1800  # 30 min timeout
+    ttlSecondsAfterFinished: 3600
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-scientific
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            # =====================================================
+            # SELECT VERSION TO TEST:
+            #   scientific-v1.14.0 - Has MR deadlock bug
+            #   scientific-v1.17.2 - Bug fixed (control)
+            # =====================================================
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-v1.14.0
+            imagePullPolicy: Always
+
+            env:
+            - name: GROUP_RANK
+              value: "0"
+            - name: MY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+            # =====================================================
+            # FAULT INJECTION SETTINGS
+            # Enable to trigger MR registration errors
+            # =====================================================
+            - name: FI_MR_INJECT_ENABLE
+              value: "1"
+            - name: FI_MR_INJECT_START
+              value: "500"    # Start injecting after 500 MR calls
+            - name: FI_MR_INJECT_RATE
+              value: "100"    # Inject every 100 calls (1% error rate)
+
+            # Test configuration
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: ITERATIONS
+              value: "5000"
+            - name: NNODES
+              value: "2"
+            - name: GPUS_PER_NODE
+              value: "8"
+
+            # NCCL settings
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "120"  # Short timeout to detect deadlock faster
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+
+            # EFA settings
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-scientific
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-scientific
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-v1.14.0
+            imagePullPolicy: Always
+
+            env:
+            - name: GROUP_RANK
+              value: "1"
+
+            # Same fault injection settings
+            - name: FI_MR_INJECT_ENABLE
+              value: "1"
+            - name: FI_MR_INJECT_START
+              value: "500"
+            - name: FI_MR_INJECT_RATE
+              value: "100"
+
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: ITERATIONS
+              value: "5000"
+            - name: NNODES
+              value: "2"
+            - name: GPUS_PER_NODE
+              value: "8"
+
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "120"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

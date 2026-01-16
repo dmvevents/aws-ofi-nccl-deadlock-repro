@@ -1,0 +1,96 @@
+# Single-Node Scientific Test for Fault Injection Validation
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: fault-inject-test
+  namespace: kubeflow
+  labels:
+    test-type: fault-injection-validation
+spec:
+  nprocPerNode: "8"
+
+  runPolicy:
+    activeDeadlineSeconds: 600
+    ttlSecondsAfterFinished: 3600
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: fault-inject-test
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:scientific-with-bug
+            imagePullPolicy: Always
+
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              echo "=============================================="
+              echo "FAULT INJECTION VALIDATION TEST"
+              echo "=============================================="
+              cat /opt/aws-ofi-nccl-version.txt
+
+              export LD_LIBRARY_PATH=/opt/libfabric-fault-inject/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+              export NCCL_NET="AWS Libfabric"
+              export FI_PROVIDER=efa
+              export FI_EFA_USE_HUGE_PAGE=0
+              export NCCL_DEBUG=INFO
+              export NCCL_DEBUG_SUBSYS=INIT,NET
+              export NCCL_TIMEOUT=300
+
+              export FI_EFA_MR_INJECT_ENABLE=1
+              export FI_EFA_MR_INJECT_START=10
+              export FI_EFA_MR_INJECT_RATE=5
+
+              echo "FI_EFA_MR_INJECT settings: ENABLE=$FI_EFA_MR_INJECT_ENABLE START=$FI_EFA_MR_INJECT_START RATE=$FI_EFA_MR_INJECT_RATE"
+
+              ls -la /opt/libfabric-fault-inject/lib/ | head -3
+
+              torchrun --standalone --nproc_per_node=8 /workspace/moe_stress_test.py
+
+            env:
+            - name: ITERATIONS
+              value: "500"
+            - name: REPORT_INTERVAL
+              value: "50"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

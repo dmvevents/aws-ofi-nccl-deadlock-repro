@@ -1,0 +1,241 @@
+# PyTorchJob for aws-ofi-nccl Bug Testing
+#
+# Test matrix:
+#   BUG_VARIANT=v1.14.0  → MR deadlock bug (should hang with fault injection)
+#   BUG_VARIANT=v1.17.2  → Schedule leak bug (memory grows over time)
+#   BUG_VARIANT=none     → Fixed version (control, should pass all tests)
+#
+# Test scripts:
+#   TEST_SCRIPT=moe_stress_test.py   → Tests MR deadlock (Bug₁)
+#   TEST_SCRIPT=rdma_stress_test.py  → Tests schedule leak (Bug₃)
+#
+# Usage:
+#   1. Edit BUG_VARIANT and TEST_SCRIPT below
+#   2. kubectl apply -f pytorchjob-bug-test.yaml
+#   3. kubectl logs -f deadlock-bug-test-master-0 -n kubeflow
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deadlock-bug-test-headless
+  namespace: kubeflow
+spec:
+  clusterIP: None
+  selector:
+    app: deadlock-bug-test
+  ports:
+  - port: 23456
+    name: master
+---
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-bug-test
+  namespace: kubeflow
+  labels:
+    test-type: bug-reproduction
+spec:
+  nprocPerNode: "8"
+
+  runPolicy:
+    activeDeadlineSeconds: 3600  # 1 hour max
+    ttlSecondsAfterFinished: 7200
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-bug-test
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            # =====================================================
+            # CHANGE THIS to test different variants:
+            #   aws-ofi-nccl-v1.14.0  - Has MR deadlock (Bug₁)
+            #   aws-ofi-nccl-v1.17.2  - Has schedule leak (Bug₃)
+            #   aws-ofi-nccl-none     - Fixed (control)
+            # =====================================================
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:aws-ofi-nccl-v1.14.0
+            imagePullPolicy: Always
+
+            env:
+            - name: GROUP_RANK
+              value: "0"
+
+            # =====================================================
+            # Test configuration
+            # =====================================================
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"  # or rdma_stress_test.py
+            - name: ITERATIONS
+              value: "5000"
+            - name: REPORT_INTERVAL
+              value: "100"
+
+            # NCCL settings
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+
+            # EFA settings
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+
+            # PyTorch settings
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+
+            # =====================================================
+            # For Bug₁ testing: Enable fault injection
+            # (Only works if libfabric is also patched)
+            # =====================================================
+            # - name: FI_EFA_MR_INJECT_ENABLE
+            #   value: "1"
+            # - name: FI_EFA_MR_INJECT_START
+            #   value: "500"
+            # - name: FI_EFA_MR_INJECT_RATE
+            #   value: "50"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-bug-test
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-bug-test
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            # Same image as master
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:aws-ofi-nccl-v1.14.0
+            imagePullPolicy: Always
+
+            env:
+            - name: GROUP_RANK
+              value: "1"
+
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: ITERATIONS
+              value: "5000"
+            - name: REPORT_INTERVAL
+              value: "100"
+
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

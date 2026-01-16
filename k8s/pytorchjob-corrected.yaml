@@ -42,6 +42,8 @@ spec:
           annotations:
             # Useful for debugging
             cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            # Disable Istio sidecar injection (PyTorchJob incompatible with Istio)
+            sidecar.istio.io/inject: "false"
         spec:
           hostNetwork: true
           dnsPolicy: ClusterFirstWithHostNet
@@ -156,6 +158,8 @@ spec:
             test-type: vulnerable
           annotations:
             cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            # Disable Istio sidecar injection (PyTorchJob incompatible with Istio)
+            sidecar.istio.io/inject: "false"
         spec:
           hostNetwork: true
           dnsPolicy: ClusterFirstWithHostNet
@@ -283,6 +287,8 @@ spec:
             test-type: control
           annotations:
             cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            # Disable Istio sidecar injection (PyTorchJob incompatible with Istio)
+            sidecar.istio.io/inject: "false"
         spec:
           hostNetwork: true
           dnsPolicy: ClusterFirstWithHostNet
@@ -382,6 +388,8 @@ spec:
             test-type: control
           annotations:
             cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            # Disable Istio sidecar injection (PyTorchJob incompatible with Istio)
+            sidecar.istio.io/inject: "false"
         spec:
           hostNetwork: true
           dnsPolicy: ClusterFirstWithHostNet

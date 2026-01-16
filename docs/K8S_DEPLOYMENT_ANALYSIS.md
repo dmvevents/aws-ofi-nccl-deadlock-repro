@@ -2,6 +2,9 @@
 
 Pre-deployment analysis and best practice review for the aws-ofi-nccl deadlock reproduction test on EKS.
 
+**Last Updated**: 2026-01-16
+**Verified Against**: AWS EFA Cheatsheet, AWS EKS Best Practices, Kubeflow Documentation
+
 ## Executive Summary
 
 | Category | Status | Critical Issues |
@@ -536,3 +539,139 @@ kubectl logs -n kubeflow <pod-name> | grep -E "EFA|aws-ofi-nccl|fi_info"
 | `TORCH_DISTRIBUTED_TIMEOUT` | YES | `300` | Match NCCL timeout |
 | `LIBRARY_MODE` | YES | `vulnerable`/`fixed` | Select test version |
 | `MR_ERROR_RATE` | YES | `50` | Inject error every N calls |
+
+---
+
+## 13. Internet Research Findings (2026-01-16)
+
+This section documents findings from official AWS documentation and community best practices.
+
+### 13.1 AWS EFA Cheatsheet Alignment
+
+**Source**: [AWS EFA Cheatsheet](https://github.com/aws-samples/awsome-distributed-training/blob/main/1.architectures/efa-cheatsheet.md)
+
+| Our Setting | AWS Recommendation | Status |
+|-------------|-------------------|--------|
+| `FI_EFA_USE_HUGE_PAGE=0` | Set to 0 for fork()/GC issues | ✅ Aligned |
+| `FI_PROVIDER=efa` | Only needed for aws-ofi-nccl ≤1.5.0 | ⚠️ Not harmful, but unnecessary for 1.17.2 |
+| `NCCL_PROTO` | NOT SET | ✅ Correct (disables tuner if set) |
+| `NCCL_ALGO` | NOT SET | ✅ Correct (disables tuner if set) |
+| `NCCL_SOCKET_IFNAME` | NOT SET | ✅ Correct (P5 doesn't use eth0) |
+| `FI_EFA_USE_DEVICE_RDMA` | NOT SET | ✅ Correct (auto-enabled in libfabric ≥1.18.0) |
+
+**Critical Warning from AWS**:
+> "Do NOT set `RDMAV_FORK_SAFE=1` - can break things on newer kernels"
+
+### 13.2 NCCL_NVLS_ENABLE Justification
+
+**Source**: [NVIDIA NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html)
+
+Setting `NCCL_NVLS_ENABLE=0` is appropriate because:
+1. NVLS (NVLink SHARP) can cause hangs in some configurations
+2. Known issue: "NCCL 2.19.4 hang if NCCL_NVLS_ENABLE=1" ([GitHub #1197](https://github.com/NVIDIA/nccl/issues/1197))
+3. AWS P5 instances may have fabric manager issues with NVLS enabled
+4. Disabling NVLS still allows other NVLink transports to function
+
+### 13.3 HyperPod Training Operator Considerations
+
+**Source**: [AWS HyperPod Documentation](https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-eks.html)
+
+If deploying on HyperPod EKS:
+- Consider using `HyperPodPyTorchJob` instead of standard `PyTorchJob`
+- HyperPod provides automatic EFA health checks
+- Job auto-resume on EFA failures is available
+
+**Note**: Our current YAML uses standard Kubeflow `PyTorchJob`, which works but doesn't have HyperPod's auto-recovery features.
+
+### 13.4 EKS Best Practices Alignment
+
+**Source**: [AWS EKS Best Practices - AI/ML](https://docs.aws.amazon.com/eks/latest/best-practices/aiml-compute.html)
+
+| Best Practice | Our Status |
+|--------------|------------|
+| Use cluster placement groups | ⚠️ Not configured (needs node-level setup) |
+| Implement checkpointing | N/A (stress test, not training) |
+| Extended termination grace period | ✅ Added `terminationGracePeriodSeconds: 30` |
+| Monitor RDMA errors | ⚠️ Requires CloudWatch/DCGM setup |
+| Disable Istio sidecar injection | ⚠️ May need `sidecar.istio.io/inject: "false"` |
+
+### 13.5 Version Compatibility Matrix
+
+**Source**: [EFA Best Practices](https://swsmith.cc/posts/efa-best-practices.html)
+
+For P5.48xlarge (our target):
+
+| Component | Minimum | Recommended | Our Container |
+|-----------|---------|-------------|---------------|
+| CUDA | ≥12.0 | 12.2+ | ✅ 12.9 |
+| NCCL | ≥2.18.0 | 2.18.5+ | ✅ 2.27.3 |
+| aws-ofi-nccl | ≥1.7.2 | 1.7.3+ | ✅ 1.17.2 |
+| libfabric | ≥1.18.0 | 1.22+ | ✅ 1.22.0 |
+
+### 13.6 Variables We Should NOT Set
+
+Based on AWS documentation, these variables should NOT be set:
+
+| Variable | Reason |
+|----------|--------|
+| `RDMAV_FORK_SAFE=1` | Breaks on newer kernels |
+| `NCCL_PROTO=simple` | Disables aws-ofi-nccl tuner |
+| `NCCL_ALGO=*` | Disables aws-ofi-nccl tuner |
+| `NCCL_SOCKET_IFNAME=eth0` | P5 instances don't use eth0 |
+| `FI_EFA_USE_DEVICE_RDMA=1` | Auto-enabled in libfabric ≥1.18.0 |
+| `NCCL_P2P_DISABLE=1` | Disables NVLink (massive perf loss) |
+| `NCCL_IB_DISABLE=1` | Not applicable to EFA |
+
+### 13.7 Potential Issues Identified
+
+#### Issue 1: Istio Sidecar Injection
+**Risk**: PyTorchJob may fail if Istio auto-injects sidecars
+**Mitigation**: Add annotation if Istio is installed:
+```yaml
+annotations:
+  sidecar.istio.io/inject: "false"
+```
+
+#### Issue 2: Placement Groups
+**Risk**: Without placement groups, inter-node latency may be higher
+**Mitigation**: Ensure EKS nodes are in cluster placement groups (node-level config)
+
+#### Issue 3: EFA Device Plugin
+**Risk**: EFA resources won't be available without device plugin
+**Verification**:
+```bash
+kubectl get pods -n kube-system -l name=aws-efa-k8s-device-plugin
+```
+
+### 13.8 Recommended Pre-Flight Checks
+
+Based on internet research, run these before deployment:
+
+```bash
+# 1. Verify EFA device plugin is running
+kubectl get pods -n kube-system | grep efa
+
+# 2. Check EFA resources on nodes
+kubectl get nodes -o json | jq '.items[] | {name: .metadata.name, efa: .status.allocatable["vpc.amazonaws.com/efa"]}'
+
+# 3. Verify Training Operator
+kubectl get crd pytorchjobs.kubeflow.org
+
+# 4. Check for Istio (if present, need annotation)
+kubectl get ns istio-system 2>/dev/null && echo "Istio detected - add sidecar.istio.io/inject: false"
+
+# 5. Verify hugepages
+kubectl get nodes -o json | jq '.items[] | {name: .metadata.name, hugepages: .status.allocatable["hugepages-2Mi"]}'
+```
+
+---
+
+## 14. References
+
+- [AWS EFA Cheatsheet](https://github.com/aws-samples/awsome-distributed-training/blob/main/1.architectures/efa-cheatsheet.md)
+- [AWS EKS Best Practices - AI/ML](https://docs.aws.amazon.com/eks/latest/best-practices/aiml-compute.html)
+- [aws-ofi-nccl GitHub](https://github.com/aws/aws-ofi-nccl)
+- [Kubeflow PyTorchJob](https://www.kubeflow.org/docs/components/trainer/legacy-v1/user-guides/pytorch/)
+- [NVIDIA NCCL Environment Variables](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html)
+- [SageMaker HyperPod EKS](https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-eks.html)
+- [EFA Best Practices (Sean Smith)](https://swsmith.cc/posts/efa-best-practices.html)

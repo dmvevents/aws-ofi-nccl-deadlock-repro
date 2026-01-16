@@ -1,0 +1,256 @@
+# PyTorchJob for aws-ofi-nccl Deadlock Reproduction Test
+# HYPERPOD VERSION - Fixed for hostNetwork DNS resolution
+#
+# Key fix: Added subdomain and headless service for proper DNS resolution
+# when using hostNetwork: true
+#
+---
+# Headless service for DNS resolution with hostNetwork
+apiVersion: v1
+kind: Service
+metadata:
+  name: deadlock-test-headless
+  namespace: kubeflow
+spec:
+  clusterIP: None
+  selector:
+    app: deadlock-test-vulnerable
+  ports:
+  - port: 23456
+    name: master
+---
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-test-vulnerable
+  namespace: kubeflow
+  labels:
+    test-type: vulnerable
+    test-name: aws-ofi-nccl-deadlock
+spec:
+  nprocPerNode: "8"
+
+  runPolicy:
+    activeDeadlineSeconds: 1800
+    ttlSecondsAfterFinished: 3600
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-vulnerable
+            test-type: vulnerable
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            sidecar.istio.io/inject: "false"
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+          # These enable proper DNS resolution with hostNetwork
+          subdomain: deadlock-test-headless
+          setHostnameAsFQDN: false
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            # Override MASTER_ADDR with pod IP (hostNetwork DNS fix)
+            - name: MY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Test configuration
+            - name: LIBRARY_MODE
+              value: "vulnerable"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+
+            # NCCL settings
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+
+            # EFA settings
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+
+            # PyTorch settings
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+                - SYS_PTRACE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-vulnerable
+            test-type: vulnerable
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            sidecar.istio.io/inject: "false"
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+          subdomain: deadlock-test-headless
+          setHostnameAsFQDN: false
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-test-vulnerable
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            - name: LIBRARY_MODE
+              value: "vulnerable"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+                - SYS_PTRACE

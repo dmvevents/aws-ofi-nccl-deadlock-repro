@@ -1,0 +1,216 @@
+# PyTorchJob for aws-ofi-nccl Deadlock Reproduction Test
+# SIMPLE VERSION - No hostNetwork (let K8s handle DNS)
+#
+# The EFA device plugin provides access to EFA devices without needing hostNetwork.
+# This allows normal Kubernetes DNS resolution to work.
+#
+---
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-test-vulnerable
+  namespace: kubeflow
+  labels:
+    test-type: vulnerable
+spec:
+  nprocPerNode: "8"
+
+  runPolicy:
+    activeDeadlineSeconds: 1800
+    ttlSecondsAfterFinished: 3600
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-vulnerable
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          # NO hostNetwork - let K8s DNS work normally
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            # Set GROUP_RANK for entrypoint (container checks this, not NODE_RANK)
+            - name: GROUP_RANK
+              value: "0"
+            # Test configuration
+            - name: LIBRARY_MODE
+              value: "vulnerable"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+
+            # NCCL settings
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+
+            # EFA settings
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+
+            # PyTorch settings
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-vulnerable
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: ml.p5.48xlarge
+
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-test-vulnerable
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            # GROUP_RANK=1 for worker (entrypoint uses this)
+            - name: GROUP_RANK
+              value: "1"
+            - name: LIBRARY_MODE
+              value: "vulnerable"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

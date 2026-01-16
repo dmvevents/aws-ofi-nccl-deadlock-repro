@@ -162,18 +162,58 @@ if [ -n "$WORLD_SIZE" ] && [ -n "$RANK" ] && [ -n "$MASTER_ADDR" ]; then
     PYTORCHJOB_DISTRIBUTED=true
 fi
 
+# Helper function to resolve hostname to IP (needed for hostNetwork mode)
+resolve_master_addr() {
+    local addr="$1"
+    # Check if already an IP address
+    if echo "$addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "$addr"
+        return
+    fi
+    # Try to resolve hostname
+    local resolved=$(getent hosts "$addr" 2>/dev/null | awk '{print $1}' | head -1)
+    if [ -n "$resolved" ]; then
+        echo "$resolved"
+        return
+    fi
+    # Try nslookup as fallback
+    resolved=$(nslookup "$addr" 2>/dev/null | grep -A1 "Name:" | grep Address | awk '{print $2}' | head -1)
+    if [ -n "$resolved" ]; then
+        echo "$resolved"
+        return
+    fi
+    # Return original if unable to resolve
+    echo "$addr"
+}
+
 if [ "$PYTORCHJOB_DISTRIBUTED" = "true" ]; then
     # PyTorchJob already configured distributed environment
-    # Don't use torchrun - it will conflict with existing env vars
     echo "Detected PyTorchJob distributed setup:"
     echo "  WORLD_SIZE:  $WORLD_SIZE"
     echo "  RANK:        $RANK"
-    echo "  LOCAL_RANK:  $LOCAL_RANK"
+    echo "  LOCAL_RANK:  ${LOCAL_RANK:-0}"
     echo "  MASTER_ADDR: $MASTER_ADDR"
     echo "  MASTER_PORT: $MASTER_PORT"
+
+    # With hostNetwork, Kubernetes DNS may not resolve pod names
+    # Try to resolve MASTER_ADDR to IP
+    RESOLVED_ADDR=$(resolve_master_addr "$MASTER_ADDR")
+    if [ "$RESOLVED_ADDR" != "$MASTER_ADDR" ]; then
+        echo "  RESOLVED:    $RESOLVED_ADDR (from $MASTER_ADDR)"
+        export MASTER_ADDR="$RESOLVED_ADDR"
+    fi
     echo ""
-    echo "Launching directly (PyTorchJob handles distribution)..."
-    exec python3 /opt/tests/$TEST_SCRIPT "$@"
+
+    # PyTorchJob uses torchrun internally, but we need to handle multi-GPU per node
+    # The Training Operator launches one pod per replica, with nprocPerNode processes each
+    echo "Launching $GPUS_PER_NODE processes via torchrun..."
+    exec torchrun \
+        --nnodes=$NNODES \
+        --nproc_per_node=$GPUS_PER_NODE \
+        --node_rank=${GROUP_RANK:-$RANK} \
+        --master_addr=$MASTER_ADDR \
+        --master_port=$MASTER_PORT \
+        /opt/tests/$TEST_SCRIPT "$@"
 
 elif [ -n "$SLURM_JOB_ID" ]; then
     echo "Launching via SLURM srun..."

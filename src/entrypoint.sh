@@ -112,6 +112,11 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_TIMEOUT=${NCCL_TIMEOUT:-300}
 export NCCL_NVLS_ENABLE=0
 
+# PyTorch distributed timeout - MUST match NCCL_TIMEOUT
+export TORCH_DISTRIBUTED_TIMEOUT=${TORCH_DISTRIBUTED_TIMEOUT:-$NCCL_TIMEOUT}
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 echo ""
 echo "Environment:"
 echo "  LD_LIBRARY_PATH: $(echo $LD_LIBRARY_PATH | cut -d: -f1-2)..."
@@ -150,7 +155,32 @@ TEST_SCRIPT=${TEST_SCRIPT:-moe_stress_test.py}
 echo "Running: $TEST_SCRIPT"
 echo ""
 
-if [ "$GPUS_PER_NODE" -gt 1 ] && [ -n "$MASTER_ADDR" ]; then
+# Detect if PyTorchJob already set up distributed environment
+# PyTorchJob sets: WORLD_SIZE, RANK, MASTER_ADDR, MASTER_PORT, LOCAL_RANK
+PYTORCHJOB_DISTRIBUTED=false
+if [ -n "$WORLD_SIZE" ] && [ -n "$RANK" ] && [ -n "$MASTER_ADDR" ]; then
+    PYTORCHJOB_DISTRIBUTED=true
+fi
+
+if [ "$PYTORCHJOB_DISTRIBUTED" = "true" ]; then
+    # PyTorchJob already configured distributed environment
+    # Don't use torchrun - it will conflict with existing env vars
+    echo "Detected PyTorchJob distributed setup:"
+    echo "  WORLD_SIZE:  $WORLD_SIZE"
+    echo "  RANK:        $RANK"
+    echo "  LOCAL_RANK:  $LOCAL_RANK"
+    echo "  MASTER_ADDR: $MASTER_ADDR"
+    echo "  MASTER_PORT: $MASTER_PORT"
+    echo ""
+    echo "Launching directly (PyTorchJob handles distribution)..."
+    exec python3 /opt/tests/$TEST_SCRIPT "$@"
+
+elif [ -n "$SLURM_JOB_ID" ]; then
+    echo "Launching via SLURM srun..."
+    exec python3 /opt/tests/$TEST_SCRIPT "$@"
+
+elif [ "$GPUS_PER_NODE" -gt 1 ] && [ -n "$MASTER_ADDR" ]; then
+    # Manual distributed setup (non-Kubeflow, non-SLURM)
     echo "Launching via torchrun..."
     exec torchrun \
         --nnodes=$NNODES \
@@ -159,9 +189,7 @@ if [ "$GPUS_PER_NODE" -gt 1 ] && [ -n "$MASTER_ADDR" ]; then
         --master_addr=$MASTER_ADDR \
         --master_port=$MASTER_PORT \
         /opt/tests/$TEST_SCRIPT "$@"
-elif [ -n "$SLURM_JOB_ID" ]; then
-    echo "Launching via SLURM srun..."
-    exec python3 /opt/tests/$TEST_SCRIPT "$@"
+
 else
     echo "Launching single process..."
     exec python3 /opt/tests/$TEST_SCRIPT "$@"

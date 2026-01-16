@@ -1,0 +1,476 @@
+# PyTorchJob for aws-ofi-nccl Deadlock Reproduction Test
+# CORRECTED VERSION - Addresses all identified issues
+#
+# Changes from original:
+#   - Added runPolicy with activeDeadlineSeconds (timeout)
+#   - Added missing NCCL/EFA environment variables
+#   - Fixed memory limits
+#   - Added TORCH_DISTRIBUTED_TIMEOUT
+#   - Updated image path
+#
+# Usage:
+#   kubectl apply -f pytorchjob-corrected.yaml -n kubeflow
+#   kubectl logs -f -n kubeflow -l training.kubeflow.org/job-name=deadlock-test-vulnerable
+#
+---
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-test-vulnerable
+  namespace: kubeflow
+  labels:
+    test-type: vulnerable
+    test-name: aws-ofi-nccl-deadlock
+spec:
+  nprocPerNode: "8"
+
+  # Run policy - CRITICAL for deadlock testing
+  runPolicy:
+    activeDeadlineSeconds: 1800    # Kill job after 30 min (deadlock should happen before)
+    ttlSecondsAfterFinished: 3600  # Auto-cleanup after 1 hour
+    backoffLimit: 0                # Don't retry - we want to see the failure
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test
+            test-type: vulnerable
+          annotations:
+            # Useful for debugging
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+
+          volumes:
+          # Shared memory for NCCL (sized for 8x H100)
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          # EFA RDMA devices
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+
+          containers:
+          - name: pytorch
+            # UPDATE THIS IMAGE PATH for your account/region
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            # ===========================================
+            # TEST CONFIGURATION
+            # ===========================================
+            - name: LIBRARY_MODE
+              value: "vulnerable"        # Use 1.14.0 (has deadlock bug)
+            - name: MR_ERROR_RATE
+              value: "50"                # Inject error every 50 fi_mr_reg calls
+            - name: MR_ERROR_START
+              value: "500"               # Start injection after 500 calls (after warmup)
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+
+            # ===========================================
+            # NCCL SETTINGS (CRITICAL FOR EFA)
+            # ===========================================
+            - name: NCCL_NET
+              value: "AWS Libfabric"     # CRITICAL: Force aws-ofi-nccl plugin
+            - name: NCCL_DEBUG
+              value: "INFO"              # Use INFO to verify EFA initialization
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"          # Show network plugin loading
+            - name: NCCL_TIMEOUT
+              value: "300"               # 5 min timeout for NCCL ops
+            - name: NCCL_NVLS_ENABLE
+              value: "0"                 # Disable NVLS (prevents NVLink errors)
+
+            # ===========================================
+            # EFA/LIBFABRIC SETTINGS
+            # ===========================================
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"                 # Prevents fork()/mmap memory issues
+
+            # ===========================================
+            # PYTORCH DISTRIBUTED SETTINGS
+            # ===========================================
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"               # MUST match NCCL_TIMEOUT
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"                 # Better error handling
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32    # P5.48xlarge has 32 EFA devices
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi                # Added memory limit
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK       # Required for RDMA memory registration
+                - SYS_RESOURCE   # Required for ulimit changes
+                - SYS_PTRACE     # Useful for debugging hangs
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test
+            test-type: vulnerable
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+
+          # Ensure worker is on different node than master
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-test
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            # Test configuration (same as master)
+            - name: LIBRARY_MODE
+              value: "vulnerable"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            # NCCL settings
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            # EFA settings
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+            # PyTorch settings
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+                - SYS_PTRACE
+---
+# Control test: Fixed library (should NOT deadlock)
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-test-control
+  namespace: kubeflow
+  labels:
+    test-type: control
+    test-name: aws-ofi-nccl-deadlock
+spec:
+  nprocPerNode: "8"
+
+  runPolicy:
+    activeDeadlineSeconds: 1800
+    ttlSecondsAfterFinished: 3600
+    backoffLimit: 0
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-control
+            test-type: control
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            # Use FIXED library (1.17.2) - should NOT deadlock
+            - name: LIBRARY_MODE
+              value: "fixed"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            # NCCL settings
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            # EFA settings
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+            # PyTorch settings
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+                - SYS_PTRACE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-control
+            test-type: control
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          terminationGracePeriodSeconds: 30
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-test-control
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+
+          containers:
+          - name: pytorch
+            image: 058264135704.dkr.ecr.us-east-2.amazonaws.com/deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            - name: LIBRARY_MODE
+              value: "fixed"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            - name: NCCL_NET
+              value: "AWS Libfabric"
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+            - name: TORCH_DISTRIBUTED_TIMEOUT
+              value: "300"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 400Gi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 200Gi
+                cpu: 48
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+                - SYS_PTRACE

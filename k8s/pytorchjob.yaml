@@ -1,0 +1,363 @@
+# PyTorchJob for aws-ofi-nccl Deadlock Reproduction Test
+#
+# Prerequisites:
+#   - Kubeflow Training Operator installed
+#   - Nodes with NVIDIA GPUs and AWS EFA
+#   - Image pushed to accessible registry
+#
+# Usage:
+#   # Run vulnerable test (should deadlock)
+#   kubectl apply -f pytorchjob.yaml -n kubeflow
+#   kubectl logs -f -n kubeflow -l training.kubeflow.org/job-name=deadlock-test-vulnerable
+#
+#   # Clean up
+#   kubectl delete pytorchjob deadlock-test-vulnerable deadlock-test-control -n kubeflow
+#
+# Update the image path below before applying!
+---
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-test-vulnerable
+  namespace: kubeflow
+  labels:
+    test-type: vulnerable
+spec:
+  nprocPerNode: "8"
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test
+            test-type: vulnerable
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+
+          # Update this selector for your cluster
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+            # Or use labels like:
+            # accelerator: h100
+
+          volumes:
+          # Shared memory for NCCL
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          # EFA RDMA devices
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+          # GPUDirect RDMA driver
+          - name: gdrdrv
+            hostPath:
+              path: /dev/gdrdrv
+
+          containers:
+          - name: pytorch
+            # UPDATE THIS IMAGE PATH
+            image: <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/aws-ofi-nccl-deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            # Use vulnerable library (1.14.0)
+            - name: LIBRARY_MODE
+              value: "vulnerable"
+            # Enable error injection
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            # Test configuration
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            # NCCL settings
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_TIMEOUT
+              value: "300"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                memory: 200Gi
+                cpu: "48"
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+            - name: gdrdrv
+              mountPath: /dev/gdrdrv
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test
+            test-type: vulnerable
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+
+          # Ensure worker is on different node than master
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-test
+                topologyKey: kubernetes.io/hostname
+
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+          - name: gdrdrv
+            hostPath:
+              path: /dev/gdrdrv
+
+          containers:
+          - name: pytorch
+            image: <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/aws-ofi-nccl-deadlock-test:latest
+            imagePullPolicy: Always
+
+            env:
+            - name: LIBRARY_MODE
+              value: "vulnerable"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_TIMEOUT
+              value: "300"
+
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                memory: 200Gi
+                cpu: "48"
+
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+            - name: gdrdrv
+              mountPath: /dev/gdrdrv
+
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+---
+# Control test: Fixed library (should NOT deadlock)
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: deadlock-test-control
+  namespace: kubeflow
+  labels:
+    test-type: control
+spec:
+  nprocPerNode: "8"
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-control
+            test-type: control
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+          - name: gdrdrv
+            hostPath:
+              path: /dev/gdrdrv
+          containers:
+          - name: pytorch
+            image: <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/aws-ofi-nccl-deadlock-test:latest
+            imagePullPolicy: Always
+            env:
+            # Use FIXED library (1.17.2)
+            - name: LIBRARY_MODE
+              value: "fixed"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                memory: 200Gi
+                cpu: "48"
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+            - name: gdrdrv
+              mountPath: /dev/gdrdrv
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: deadlock-test-control
+            test-type: control
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: deadlock-test-control
+                topologyKey: kubernetes.io/hostname
+          volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+          - name: gdrdrv
+            hostPath:
+              path: /dev/gdrdrv
+          containers:
+          - name: pytorch
+            image: <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/aws-ofi-nccl-deadlock-test:latest
+            imagePullPolicy: Always
+            env:
+            - name: LIBRARY_MODE
+              value: "fixed"
+            - name: MR_ERROR_RATE
+              value: "50"
+            - name: MR_ERROR_START
+              value: "500"
+            - name: TEST_SCRIPT
+              value: "moe_stress_test.py"
+            - name: GPUS_PER_NODE
+              value: "8"
+            - name: NNODES
+              value: "2"
+            - name: ITERATIONS
+              value: "1000"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_TIMEOUT
+              value: "300"
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                memory: 200Gi
+                cpu: "48"
+            volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+            - name: gdrdrv
+              mountPath: /dev/gdrdrv
+            securityContext:
+              privileged: true
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE
